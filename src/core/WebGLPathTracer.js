@@ -495,9 +495,49 @@ export class WebGLPathTracer {
 
 	dispose() {
 
-		this._quad.dispose();
 		this._quad.material.dispose();
+		this._quad.dispose();
 		this._pathTracer.dispose();
+		this._lowResPathTracer.dispose();
+
+		if ( this._internalBackground ) {
+
+			this._internalBackground.dispose();
+			this._internalBackground = null;
+
+		}
+
+		if ( this._colorBackground ) {
+
+			this._colorBackground.dispose();
+			this._colorBackground = null;
+
+		}
+
+		const generator = this._generator;
+		if ( generator.geometry ) {
+
+			generator.geometry.dispose();
+
+		}
+
+		if ( generator.bvh ) {
+
+			if ( generator.bvh instanceof Promise ) {
+
+				generator.bvh.then( bvh => {
+
+					if ( bvh && bvh.dispose ) bvh.dispose();
+
+				} );
+
+			} else if ( generator.bvh.dispose ) {
+
+				generator.bvh.dispose();
+
+			}
+
+		}
 
 	}
 

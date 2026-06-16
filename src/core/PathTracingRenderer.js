@@ -185,6 +185,24 @@ export class PathTracingRenderer {
 			this._blendTargets[ 0 ].dispose();
 			this._blendTargets[ 1 ].dispose();
 
+		} else {
+
+			// re-create blend targets (they may have been disposed when alpha was disabled)
+			const w = this._primaryTarget.width;
+			const h = this._primaryTarget.height;
+			this._blendTargets[ 0 ] = new WebGLRenderTarget( w, h, {
+				format: RGBAFormat,
+				type: FloatType,
+				magFilter: NearestFilter,
+				minFilter: NearestFilter,
+			} );
+			this._blendTargets[ 1 ] = new WebGLRenderTarget( w, h, {
+				format: RGBAFormat,
+				type: FloatType,
+				magFilter: NearestFilter,
+				minFilter: NearestFilter,
+			} );
+
 		}
 
 		this._alpha = v;
@@ -319,8 +337,16 @@ export class PathTracingRenderer {
 		}
 
 		this._primaryTarget.setSize( w, h );
-		this._blendTargets[ 0 ].setSize( w, h );
-		this._blendTargets[ 1 ].setSize( w, h );
+
+		// only resize blend targets when alpha mode is active; when alpha is
+		// disabled the blend targets are disposed
+		if ( this._alpha ) {
+
+			this._blendTargets[ 0 ].setSize( w, h );
+			this._blendTargets[ 1 ].setSize( w, h );
+
+		}
+
 		this.reset();
 
 	}
@@ -335,11 +361,21 @@ export class PathTracingRenderer {
 	dispose() {
 
 		this._primaryTarget.dispose();
-		this._blendTargets[ 0 ].dispose();
-		this._blendTargets[ 1 ].dispose();
+
+		if ( this._alpha ) {
+
+			this._blendTargets[ 0 ].dispose();
+			this._blendTargets[ 1 ].dispose();
+
+		}
+
 		this._sobolTarget.dispose();
 
+		this.material.removeEventListener( 'recompilation', this._compileFunction );
+
+		this._fsQuad.material.dispose();
 		this._fsQuad.dispose();
+		this._blendQuad.material.dispose();
 		this._blendQuad.dispose();
 		this._task = null;
 
@@ -356,13 +392,19 @@ export class PathTracingRenderer {
 		_renderer.setClearColor( 0, 0 );
 		_renderer.clearColor();
 
-		_renderer.setRenderTarget( _blendTargets[ 0 ] );
-		_renderer.setClearColor( 0, 0 );
-		_renderer.clearColor();
+		// only clear blend targets when alpha mode is active; when alpha is
+		// disabled the blend targets are disposed and must not be touched
+		if ( this._alpha ) {
 
-		_renderer.setRenderTarget( _blendTargets[ 1 ] );
-		_renderer.setClearColor( 0, 0 );
-		_renderer.clearColor();
+			_renderer.setRenderTarget( _blendTargets[ 0 ] );
+			_renderer.setClearColor( 0, 0 );
+			_renderer.clearColor();
+
+			_renderer.setRenderTarget( _blendTargets[ 1 ] );
+			_renderer.setClearColor( 0, 0 );
+			_renderer.clearColor();
+
+		}
 
 		_renderer.setClearColor( ogClearColor, ogClearAlpha );
 		_renderer.setRenderTarget( ogRenderTarget );

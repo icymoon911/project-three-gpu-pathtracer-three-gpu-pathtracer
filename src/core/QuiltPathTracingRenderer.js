@@ -220,4 +220,13 @@ export class QuiltPathTracingRenderer extends PathTracingRenderer {
 
 	}
 
+	dispose() {
+
+		super.dispose();
+		this._quiltTask = null;
+		this._quiltSamples = 0;
+		this._camera = null;
+
+	}
+
 }
