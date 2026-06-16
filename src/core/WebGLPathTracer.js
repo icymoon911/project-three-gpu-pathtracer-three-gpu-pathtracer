@@ -1,4 +1,4 @@
-import { PerspectiveCamera, Scene, Vector2, Clock, NormalBlending, NoBlending, AdditiveBlending } from 'three';
+import { PerspectiveCamera, Scene, Vector2, Clock, NormalBlending, NoBlending, AdditiveBlending, WebGLRenderTarget, RGBAFormat, FloatType, NearestFilter, ShaderMaterial } from 'three';
 import { PathTracingSceneGenerator } from './PathTracingSceneGenerator.js';
 import { PathTracingRenderer } from './PathTracingRenderer.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
@@ -6,6 +6,51 @@ import { GradientEquirectTexture } from '../textures/GradientEquirectTexture.js'
 import { getIesTextures, getLights, getTextures } from './utils/sceneUpdateUtils.js';
 import { ClampedInterpolationMaterial } from '../materials/fullscreen/ClampedInterpolationMaterial.js';
 import { CubeToEquirectGenerator } from '../utils/CubeToEquirectGenerator.js';
+import { DenoiseMaterial } from '../materials/fullscreen/DenoiseMaterial.js';
+
+// Simple linear interpolation material for blending raw and denoised textures.
+// Outputs mix(raw, denoised, blend) where blend=0 is raw and blend=1 is fully denoised.
+function createDenoiseLerpMaterial() {
+
+	const mat = new ShaderMaterial( {
+
+		uniforms: {
+
+			tRaw: { value: null },
+			tDenoised: { value: null },
+			blend: { value: 1.0 },
+
+		},
+
+		vertexShader: /* glsl */`
+			varying vec2 vUv;
+			void main() {
+				vUv = uv;
+				gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+			}
+		`,
+
+		fragmentShader: /* glsl */`
+			uniform sampler2D tRaw;
+			uniform sampler2D tDenoised;
+			uniform float blend;
+			varying vec2 vUv;
+			void main() {
+				vec4 raw = texture2D( tRaw, vUv );
+				vec4 denoised = texture2D( tDenoised, vUv );
+				gl_FragColor = mix( raw, denoised, blend );
+			}
+		`,
+
+		blending: NoBlending,
+		depthWrite: false,
+		depthTest: false,
+
+	} );
+
+	return mat;
+
+}
 
 function supportsFloatBlending( renderer ) {
 
@@ -125,6 +170,15 @@ export class WebGLPathTracer {
 		this._previousBackground = null;
 		this._internalBackground = null;
 
+		// denoise members (lazily initialized)
+		this._denoiseQuad = null;
+		this._denoiseBlendQuad = null;
+		this._denoiseTarget = null;
+		this._denoiseBlendTarget = null;
+		this._lowResDenoiseTarget = null;
+		this._lowResBlendTarget = null;
+		this._targetSamplesFired = false;
+
 		// options
 		this.renderDelay = 100;
 		this.minSamples = 5;
@@ -152,6 +206,14 @@ export class WebGLPathTracer {
 			renderer.autoClear = currentAutoClear;
 
 		};
+
+		// denoise options
+		this.enableDenoise = false;
+		this.denoiseParams = { sigma: 5.0, threshold: 0.03, kSigma: 1.0 };
+		this.denoiseAutoAdjust = 0.5; // 0..1: 0 = gentle falloff, 1 = aggressive falloff
+		this.targetSamples = 200;
+		this.denoiseResolution = 1.0; // scale factor for denoise render targets
+		this.onTargetSamplesReached = null; // callback when samples >= targetSamples
 
 		// initialize the scene so it doesn't fail
 		this.setScene( new Scene(), new PerspectiveCamera() );
@@ -383,6 +445,195 @@ export class WebGLPathTracer {
 
 	}
 
+	// ----------------------------------------------------------------
+	// Denoise pipeline helpers
+	// ----------------------------------------------------------------
+
+	_initDenoise() {
+
+		if ( this._denoiseQuad ) return;
+
+		this._denoiseQuad = new FullScreenQuad( new DenoiseMaterial( {
+			map: null,
+			transparent: false,
+			blending: NoBlending,
+		} ) );
+
+		this._denoiseBlendQuad = new FullScreenQuad( createDenoiseLerpMaterial() );
+
+		const rtOptions = {
+			format: RGBAFormat,
+			type: FloatType,
+			magFilter: NearestFilter,
+			minFilter: NearestFilter,
+		};
+
+		this._denoiseTarget = new WebGLRenderTarget( 1, 1, rtOptions );
+		this._denoiseBlendTarget = new WebGLRenderTarget( 1, 1, rtOptions );
+		this._lowResDenoiseTarget = new WebGLRenderTarget( 1, 1, rtOptions );
+		this._lowResBlendTarget = new WebGLRenderTarget( 1, 1, rtOptions );
+
+	}
+
+	_disposeDenoise() {
+
+		if ( this._denoiseQuad ) {
+
+			this._denoiseQuad.dispose();
+			this._denoiseQuad.material.dispose();
+			this._denoiseQuad = null;
+
+		}
+
+		if ( this._denoiseBlendQuad ) {
+
+			this._denoiseBlendQuad.dispose();
+			this._denoiseBlendQuad.material.dispose();
+			this._denoiseBlendQuad = null;
+
+		}
+
+		if ( this._denoiseTarget ) {
+
+			this._denoiseTarget.dispose();
+			this._denoiseTarget = null;
+
+		}
+
+		if ( this._denoiseBlendTarget ) {
+
+			this._denoiseBlendTarget.dispose();
+			this._denoiseBlendTarget = null;
+
+		}
+
+		if ( this._lowResDenoiseTarget ) {
+
+			this._lowResDenoiseTarget.dispose();
+			this._lowResDenoiseTarget = null;
+
+		}
+
+		if ( this._lowResBlendTarget ) {
+
+			this._lowResBlendTarget.dispose();
+			this._lowResBlendTarget = null;
+
+		}
+
+	}
+
+	// Compute denoise strength based on current samples and target samples.
+	// Returns a value in [0, 1] where 1 = full denoise, 0 = no denoise.
+	_computeDenoiseStrength( samples ) {
+
+		const target = this.targetSamples;
+		if ( target <= 0 ) return 0;
+
+		const t = Math.min( samples / target, 1.0 );
+
+		// Higher denoiseAutoAdjust = faster strength falloff
+		// denoiseAutoAdjust=0 -> exponent=1 (linear), 0.5 -> exponent=3, 1.0 -> exponent=5
+		const exponent = 1.0 + this.denoiseAutoAdjust * 4.0;
+		return Math.pow( 1.0 - t, exponent );
+
+	}
+
+	// Apply denoise pipeline to a source texture.
+	// Returns the texture that should be used for display.
+	// sourceTexture: the raw path tracer output texture
+	// strength: denoise strength [0, 1]
+	// denoiseTarget: WebGLRenderTarget for denoised output
+	// blendTarget: WebGLRenderTarget for blended output
+	_applyDenoise( sourceTexture, strength, denoiseTarget, blendTarget ) {
+
+		// Below this threshold, skip denoise entirely and use raw
+		if ( strength <= 0.01 ) {
+
+			return sourceTexture;
+
+		}
+
+		this._initDenoise();
+
+		const renderer = this._renderer;
+		const denoiseQuad = this._denoiseQuad;
+		const blendQuad = this._denoiseBlendQuad;
+
+		// Ensure targets are sized to match the source texture
+		const sourceImage = sourceTexture.image;
+		let srcW, srcH;
+		if ( sourceImage ) {
+
+			srcW = sourceImage.width;
+			srcH = sourceImage.height;
+
+		} else {
+
+			// Fallback: use the render target dimensions
+			srcW = sourceTexture.source.data.width || 1;
+			srcH = sourceTexture.source.data.height || 1;
+
+		}
+
+		const denoiseScale = this.denoiseResolution;
+		const dW = Math.max( 1, Math.floor( srcW * denoiseScale ) );
+		const dH = Math.max( 1, Math.floor( srcH * denoiseScale ) );
+
+		if ( denoiseTarget.width !== dW || denoiseTarget.height !== dH ) {
+
+			denoiseTarget.setSize( dW, dH );
+
+		}
+
+		// Compute effective denoise params
+		const baseParams = this.denoiseParams;
+		const effectiveSigma = baseParams.sigma * strength;
+		const effectiveThreshold = baseParams.threshold / Math.max( strength, 0.01 );
+		const effectiveKSigma = baseParams.kSigma * strength;
+
+		// Render denoise pass: sourceTexture → denoiseTarget
+		const denoiseMat = denoiseQuad.material;
+		denoiseMat.uniforms.map.value = sourceTexture;
+		denoiseMat.uniforms.sigma.value = effectiveSigma;
+		denoiseMat.uniforms.threshold.value = effectiveThreshold;
+		denoiseMat.uniforms.kSigma.value = effectiveKSigma;
+		denoiseMat.uniforms.opacity.value = 1.0;
+
+		const ogRenderTarget = renderer.getRenderTarget();
+		renderer.setRenderTarget( denoiseTarget );
+		renderer.autoClear = true;
+		denoiseQuad.render( renderer );
+		renderer.setRenderTarget( ogRenderTarget );
+
+		// If strength is near 1.0, use denoised directly (no blending needed)
+		if ( strength >= 0.99 ) {
+
+			return denoiseTarget.texture;
+
+		}
+
+		// Blend raw and denoised: mix(source, denoised, strength) → blendTarget
+		if ( blendTarget.width !== dW || blendTarget.height !== dH ) {
+
+			blendTarget.setSize( dW, dH );
+
+		}
+
+		const blendMat = blendQuad.material;
+		blendMat.uniforms.tRaw.value = sourceTexture;
+		blendMat.uniforms.tDenoised.value = denoiseTarget.texture;
+		blendMat.uniforms.blend.value = strength;
+
+		renderer.setRenderTarget( blendTarget );
+		renderer.autoClear = true;
+		blendQuad.render( renderer );
+		renderer.setRenderTarget( ogRenderTarget );
+
+		return blendTarget.texture;
+
+	}
+
 	renderSample() {
 
 		const lowResPathTracer = this._lowResPathTracer;
@@ -398,6 +649,7 @@ export class WebGLPathTracer {
 			pathTracer.reset();
 			lowResPathTracer.reset();
 			this._queueReset = false;
+			this._targetSamplesFired = false;
 
 			quad.material.opacity = 0;
 			clock.start();
@@ -417,6 +669,10 @@ export class WebGLPathTracer {
 		// rendering with a blend function
 		pathTracer.alpha = pathTracer.material.backgroundAlpha !== 1 || ! supportsFloatBlending( renderer );
 		lowResPathTracer.alpha = pathTracer.alpha;
+
+		// Compute denoise strength for the main path tracer
+		const denoiseEnabled = this.enableDenoise;
+		const denoiseStrength = denoiseEnabled ? this._computeDenoiseStrength( this.samples ) : 0;
 
 		if ( this.renderToCanvas ) {
 
@@ -449,15 +705,50 @@ export class WebGLPathTracer {
 
 					}
 
+					// Determine the texture to display for low-res preview
+					let lowResTexture = lowResPathTracer.target.texture;
+					if ( denoiseEnabled ) {
+
+						// Denoise the low-res preview as well, using the same strength
+						// (at low samples the strength is high, giving strong denoise)
+						lowResTexture = this._applyDenoise(
+							lowResTexture,
+							denoiseStrength,
+							this._lowResDenoiseTarget,
+							this._lowResBlendTarget,
+						);
+
+					}
+
 					const currentOpacity = quad.material.opacity;
 					quad.material.opacity = 1 - quad.material.opacity;
-					quad.material.map = lowResPathTracer.target.texture;
+					quad.material.map = lowResTexture;
 					quad.render( renderer );
 					quad.material.opacity = currentOpacity;
 
 				}
 
 				if ( ! this.dynamicLowRes && this.rasterizeScene || this.dynamicLowRes && this.isCompiling ) {
+
+					// During compilation with dynamicLowRes, show the rasterized scene
+					// Optionally denoise the low-res output if we have one from a previous frame
+					if ( this.dynamicLowRes && this.isCompiling && denoiseEnabled && lowResPathTracer.samples >= 1 ) {
+
+						let lowResTexture = lowResPathTracer.target.texture;
+						lowResTexture = this._applyDenoise(
+							lowResTexture,
+							denoiseStrength,
+							this._lowResDenoiseTarget,
+							this._lowResBlendTarget,
+						);
+
+						const currentOpacity = quad.material.opacity;
+						quad.material.opacity = 1 - quad.material.opacity;
+						quad.material.map = lowResTexture;
+						quad.render( renderer );
+						quad.material.opacity = currentOpacity;
+
+					}
 
 					this.rasterizeSceneCallback( this.scene, this.camera );
 
@@ -476,9 +767,34 @@ export class WebGLPathTracer {
 
 				}
 
-				quad.material.map = pathTracer.target.texture;
+				// Determine the texture to display for the main path tracer output
+				let displayTexture = pathTracer.target.texture;
+				if ( denoiseEnabled ) {
+
+					displayTexture = this._applyDenoise(
+						displayTexture,
+						denoiseStrength,
+						this._denoiseTarget,
+						this._denoiseBlendTarget,
+					);
+
+				}
+
+				quad.material.map = displayTexture;
 				this.renderToCanvasCallback( pathTracer.target, renderer, quad );
 				quad.material.blending = NoBlending;
+
+			}
+
+			// Fire targetSamples callback
+			if (
+				! this._targetSamplesFired &&
+				this.samples >= this.targetSamples &&
+				this.onTargetSamplesReached
+			) {
+
+				this._targetSamplesFired = true;
+				this.onTargetSamplesReached( this.samples );
 
 			}
 
@@ -490,6 +806,7 @@ export class WebGLPathTracer {
 
 		this._queueReset = true;
 		this._pathTracer.samples = 0;
+		this._targetSamplesFired = false;
 
 	}
 
@@ -498,6 +815,7 @@ export class WebGLPathTracer {
 		this._quad.dispose();
 		this._quad.material.dispose();
 		this._pathTracer.dispose();
+		this._disposeDenoise();
 
 	}
 

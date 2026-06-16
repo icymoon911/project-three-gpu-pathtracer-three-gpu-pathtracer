@@ -134,6 +134,28 @@ export class WebGLPathTracer {
 	renderToCanvas: boolean;
 	textureSize: Vector2;
 
+	/** Whether to enable the optional denoise pass (default: false). */
+	enableDenoise: boolean;
+	/** Base denoise parameters used when auto-adjust is disabled or as the starting point for auto-adjust. */
+	denoiseParams: { sigma: number; threshold: number; kSigma: number };
+	/**
+	 * Controls how aggressively denoise strength falls off as samples increase.
+	 * 0 = gentle linear falloff, 1 = very aggressive (denoise drops quickly). Default: 0.5.
+	 */
+	denoiseAutoAdjust: number;
+	/**
+	 * Sample count at which denoise is fully ramped down and `onTargetSamplesReached` fires.
+	 * Default: 200.
+	 */
+	targetSamples: number;
+	/**
+	 * Scale factor for the denoise render target resolution relative to the path tracer resolution.
+	 * Lower values are faster but blurrier. Default: 1.0.
+	 */
+	denoiseResolution: number;
+	/** Callback fired once when samples reach targetSamples. */
+	onTargetSamplesReached: ( ( samples: number ) => void ) | null;
+
 	rasterizeSceneCallback: ( scene: Scene, camera: Camera ) => void;
 	renderToCanvasCallback: ( target: WebGLRenderTarget, renderer: WebGLRenderer, quad: FullScreenQuad ) => void;
 
