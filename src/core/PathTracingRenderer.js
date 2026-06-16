@@ -340,7 +340,9 @@ export class PathTracingRenderer {
 		this._sobolTarget.dispose();
 
 		this._fsQuad.dispose();
+		this._fsQuad.material.dispose();
 		this._blendQuad.dispose();
+		this._blendQuad.material.dispose();
 		this._task = null;
 
 	}

@@ -495,6 +495,24 @@ export class WebGLPathTracer {
 
 	dispose() {
 
+		this._lowResPathTracer.dispose();
+
+		if ( this._internalBackground ) {
+
+			this._internalBackground.dispose();
+			this._internalBackground = null;
+
+		}
+
+		const generator = this._generator;
+		if ( generator.bvh ) {
+
+			generator.bvh.dispose();
+
+		}
+
+		generator.geometry.dispose();
+
 		this._quad.dispose();
 		this._quad.material.dispose();
 		this._pathTracer.dispose();
