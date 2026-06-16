@@ -4,6 +4,32 @@ import { BlendMaterial } from '../materials/fullscreen/BlendMaterial.js';
 import { SobolNumberMapGenerator } from '../utils/SobolNumberMapGenerator.js';
 import { PhysicalPathTracingMaterial } from '../materials/pathtracing/PhysicalPathTracingMaterial.js';
 
+/**
+ * renderTask – generator that drives per-sample accumulation.
+ *
+ * ALPHA COMPOSITING — TWO LAYERS
+ * ------------------------------
+ * This generator implements **Layer 1** of the alpha pipeline:
+ *
+ *   Layer 1 — Sample accumulation (here, in PathTracingRenderer):
+ *     When `alpha` is true the path-traced result of each tile is blended
+ *     into `_blendTargets` via `_blendQuad` + `BlendMaterial`, using a
+ *     weight of `_opacityFactor / (samples + 1)`. The `target` getter then
+ *     returns the fully-accumulated floating-point result. Purpose:
+ *     mathematically correct alpha-weighted sample accumulation.
+ *
+ *   Layer 2 — Output compositing (in OutputCompositor, called from
+ *     WebGLPathTracer.renderSample):
+ *     Takes `target.texture` and fades it onto the canvas over
+ *     `fadeDuration` ms via a full-screen quad with
+ *     `ClampedInterpolationMaterial`. Also layers a low-res preview or a
+ *     rasterized fallback underneath while fading. Purpose: the visual
+ *     transition the user sees when the scene changes.
+ *
+ * The two layers cannot be merged because they operate on different
+ * dimensions: Layer 1 is per-sample (driven by tile iteration) while
+ * Layer 2 is per-frame (driven by wall-clock time).
+ */
 function* renderTask() {
 
 	const {
@@ -27,12 +53,17 @@ function* renderTask() {
 
 		if ( alpha ) {
 
+			// Layer 1 alpha: accumulate into floating-point blend targets
+			// with a per-sample weight, keeping the path-traced material
+			// itself un-blended so each tile's contribution is precise.
 			blendMaterial.opacity = this._opacityFactor / ( this.samples + 1 );
 			material.blending = NoBlending;
 			material.opacity = 1;
 
 		} else {
 
+			// Without alpha we can rely the GPU's standard additive
+			// blending directly on the primary target.
 			material.opacity = this._opacityFactor / ( this.samples + 1 );
 			material.blending = NormalBlending;
 
@@ -115,7 +146,9 @@ function* renderTask() {
 				_renderer.setRenderTarget( ogRenderTarget );
 				_renderer.autoClear = ogAutoClear;
 
-				// swap and blend alpha targets
+				// Layer 1 alpha: blend the freshly rendered tile into the
+				// accumulation target, then swap so the next iteration reads
+				// from the just-updated result.
 				if ( alpha ) {
 
 					blendMaterial.target1 = blendTarget1.texture;

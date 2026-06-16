@@ -69,27 +69,44 @@ export function getTextures( materials ) {
 
 }
 
-export function getLights( scene ) {
+/**
+ * Collect all visible light objects.
+ *
+ * Accepts either a single `Scene` (or any Object3D — its subtree is
+ * traversed) **or** an array of Object3D roots, each of whose subtrees is
+ * traversed. This single entry point replaces the two duplicated versions
+ * that previously lived here and inside `PathTracingSceneGenerator`.
+ *
+ * @param {Object3D|Object3D[]} sceneOrObjects
+ * @returns {Array} sorted array of light objects
+ */
+export function getLights( sceneOrObjects ) {
 
 	const lights = [];
-	scene.traverse( c => {
+	const roots = Array.isArray( sceneOrObjects ) ? sceneOrObjects : [ sceneOrObjects ];
 
-		if ( c.visible ) {
+	for ( let r = 0, rl = roots.length; r < rl; r ++ ) {
 
-			if (
-				c.isRectAreaLight ||
-				c.isSpotLight ||
-				c.isPointLight ||
-				c.isDirectionalLight
-			) {
+		roots[ r ].traverse( c => {
 
-				lights.push( c );
+			if ( c.visible ) {
+
+				if (
+					c.isRectAreaLight ||
+					c.isSpotLight ||
+					c.isPointLight ||
+					c.isDirectionalLight
+				) {
+
+					lights.push( c );
+
+				}
 
 			}
 
-		}
+		} );
 
-	} );
+	}
 
 	return lights.sort( uuidSort );
 
