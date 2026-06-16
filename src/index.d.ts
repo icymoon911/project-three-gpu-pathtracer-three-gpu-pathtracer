@@ -116,6 +116,7 @@ export class WebGLPathTracer {
 	readonly tiles: Vector2;
 	readonly camera: Camera | null;
 	readonly scene: Scene | null;
+	readonly isDenoiseActive: boolean;
 
 	multipleImportanceSampling: boolean;
 	bounces: number;
@@ -133,6 +134,21 @@ export class WebGLPathTracer {
 	rasterizeScene: boolean;
 	renderToCanvas: boolean;
 	textureSize: Vector2;
+
+	// Denoise options
+	enableDenoise: boolean;
+	denoiseResolution: number;
+	denoiseAutoAdjust: boolean;
+	denoiseAggressiveness: number;
+	denoiseSigma: number | null;
+	denoiseKSigma: number | null;
+	denoiseThreshold: number | null;
+	denoiseFadeStartSamples: number;
+	denoiseFadeEndSamples: number;
+
+	// Sample completion
+	targetSamples: number;
+	onTargetSamplesReached: ( ( samples: number ) => void ) | null;
 
 	rasterizeSceneCallback: ( scene: Scene, camera: Camera ) => void;
 	renderToCanvasCallback: ( target: WebGLRenderTarget, renderer: WebGLRenderer, quad: FullScreenQuad ) => void;

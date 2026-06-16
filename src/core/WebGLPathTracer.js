@@ -1,4 +1,4 @@
-import { PerspectiveCamera, Scene, Vector2, Clock, NormalBlending, NoBlending, AdditiveBlending } from 'three';
+import { PerspectiveCamera, Scene, Vector2, Clock, NormalBlending, NoBlending, AdditiveBlending, WebGLRenderTarget, RGBAFormat, FloatType, LinearFilter, NearestFilter } from 'three';
 import { PathTracingSceneGenerator } from './PathTracingSceneGenerator.js';
 import { PathTracingRenderer } from './PathTracingRenderer.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
@@ -6,6 +6,8 @@ import { GradientEquirectTexture } from '../textures/GradientEquirectTexture.js'
 import { getIesTextures, getLights, getTextures } from './utils/sceneUpdateUtils.js';
 import { ClampedInterpolationMaterial } from '../materials/fullscreen/ClampedInterpolationMaterial.js';
 import { CubeToEquirectGenerator } from '../utils/CubeToEquirectGenerator.js';
+import { DenoiseMaterial } from '../materials/fullscreen/DenoiseMaterial.js';
+import { DenoiseLerpMaterial } from '../materials/fullscreen/DenoiseLerpMaterial.js';
 
 function supportsFloatBlending( renderer ) {
 
@@ -100,6 +102,14 @@ export class WebGLPathTracer {
 
 	}
 
+	// Whether the denoise pass is currently producing a visible effect on the
+	// displayed output (i.e. enableDenoise is true and the blend factor > 0).
+	get isDenoiseActive() {
+
+		return this.enableDenoise && this._getDenoiseBlendFactor( this.samples ) > 0;
+
+	}
+
 	constructor( renderer ) {
 
 		// members
@@ -125,6 +135,52 @@ export class WebGLPathTracer {
 		this._previousBackground = null;
 		this._internalBackground = null;
 
+		// --- Denoise pass internals -----------------------------------------
+		// DenoiseMaterial used for the bilateral-filter pass.  toneMapped is
+		// disabled so the intermediate render target stays in linear HDR.
+		this._denoiseMaterial = new DenoiseMaterial( { toneMapped: false } );
+		this._denoiseQuad = new FullScreenQuad( this._denoiseMaterial );
+
+		// Lerp material used to blend between raw and denoised output.
+		this._denoiseLerpMaterial = new DenoiseLerpMaterial();
+		this._denoiseLerpQuad = new FullScreenQuad( this._denoiseLerpMaterial );
+
+		// Full-resolution denoise output (may be at reduced resolution when
+		// denoiseResolution < 1).  LinearFilter gives smooth upsampling.
+		this._denoiseTarget = new WebGLRenderTarget( 1, 1, {
+			format: RGBAFormat,
+			type: FloatType,
+			magFilter: LinearFilter,
+			minFilter: LinearFilter,
+		} );
+
+		// Full-resolution blend target – the lerp between raw and denoised.
+		this._denoiseBlendTarget = new WebGLRenderTarget( 1, 1, {
+			format: RGBAFormat,
+			type: FloatType,
+			magFilter: NearestFilter,
+			minFilter: NearestFilter,
+		} );
+
+		// Low-resolution counterparts (same layout, smaller dimensions).
+		this._denoiseLowResTarget = new WebGLRenderTarget( 1, 1, {
+			format: RGBAFormat,
+			type: FloatType,
+			magFilter: LinearFilter,
+			minFilter: LinearFilter,
+		} );
+
+		this._denoiseLowResBlendTarget = new WebGLRenderTarget( 1, 1, {
+			format: RGBAFormat,
+			type: FloatType,
+			magFilter: NearestFilter,
+			minFilter: NearestFilter,
+		} );
+
+		// Tracks whether the targetSamples callback has already fired for the
+		// current accumulation run.
+		this._denoiseFired = false;
+
 		// options
 		this.renderDelay = 100;
 		this.minSamples = 5;
@@ -138,6 +194,39 @@ export class WebGLPathTracer {
 		this.rasterizeScene = true;
 		this.renderToCanvas = true;
 		this.textureSize = new Vector2( 1024, 1024 );
+
+		// --- Denoise options ------------------------------------------------
+		this.enableDenoise = false;
+
+		// Resolution multiplier for the denoise render target (0–1).  Values
+		// below 1 trade quality for performance at high canvas resolutions.
+		this.denoiseResolution = 1.0;
+
+		// When true the bilateral-filter parameters are automatically adjusted
+		// based on the current sample count.
+		this.denoiseAutoAdjust = true;
+
+		// Multiplier that controls how aggressive the auto-adjusted denoise
+		// parameters are.  Higher = stronger denoise at every sample count.
+		this.denoiseAggressiveness = 1.0;
+
+		// Manual overrides – when non-null these take priority over the
+		// auto-adjusted values.
+		this.denoiseSigma = null;
+		this.denoiseKSigma = null;
+		this.denoiseThreshold = null;
+
+		// Sample-count range over which the output transitions from fully
+		// denoised (at denoiseFadeStartSamples) to fully raw (at
+		// denoiseFadeEndSamples).  Uses a smoothstep curve.
+		this.denoiseFadeStartSamples = 5;
+		this.denoiseFadeEndSamples = 100;
+
+		// When > 0, onTargetSamplesReached is invoked once the path-traced
+		// sample count first reaches this value.
+		this.targetSamples = 0;
+		this.onTargetSamplesReached = null;
+
 		this.rasterizeSceneCallback = ( scene, camera ) => {
 
 			this._renderer.render( scene, camera );
@@ -383,6 +472,116 @@ export class WebGLPathTracer {
 
 	}
 
+	// ---------------------------------------------------------------------
+	// Denoise helpers
+	// ---------------------------------------------------------------------
+
+	// Returns a value in [0, 1] describing how much of the denoised image
+	// should be blended with the raw output.  1 = fully denoised, 0 = raw.
+	_getDenoiseBlendFactor( samples ) {
+
+		const start = this.denoiseFadeStartSamples;
+		const end = this.denoiseFadeEndSamples;
+		if ( end <= start ) return samples <= start ? 1.0 : 0.0;
+		if ( samples <= start ) return 1.0;
+		if ( samples >= end ) return 0.0;
+		const t = ( samples - start ) / ( end - start );
+		// Inverted smoothstep: 1 at t=0, 0 at t=1
+		return 1.0 - t * t * ( 3.0 - 2.0 * t );
+
+	}
+
+	// Push auto-adjusted (or manually overridden) bilateral-filter parameters
+	// into the DenoiseMaterial uniforms based on the current sample count.
+	_updateDenoiseUniforms( samples ) {
+
+		const mat = this._denoiseMaterial;
+		const agg = this.denoiseAggressiveness;
+		const start = this.denoiseFadeStartSamples;
+		const end = this.denoiseFadeEndSamples;
+		const t = Math.max( 0, Math.min( 1, ( samples - start ) / ( end - start ) ) );
+
+		if ( this.denoiseAutoAdjust ) {
+
+			mat.sigma = this.denoiseSigma !== null
+				? this.denoiseSigma
+				: 5.0 * agg * ( 1.0 - t ) + 0.5;
+			mat.kSigma = this.denoiseKSigma !== null
+				? this.denoiseKSigma
+				: 1.0 * agg * ( 1.0 - t * 0.5 ) + 0.5;
+			mat.threshold = this.denoiseThreshold !== null
+				? this.denoiseThreshold
+				: 0.03 * ( 1.0 - t * 0.5 ) + 0.01;
+
+		} else {
+
+			// Manual mode – use user-supplied values or sensible defaults.
+			mat.sigma = this.denoiseSigma !== null ? this.denoiseSigma : 5.0;
+			mat.kSigma = this.denoiseKSigma !== null ? this.denoiseKSigma : 1.0;
+			mat.threshold = this.denoiseThreshold !== null ? this.denoiseThreshold : 0.03;
+
+		}
+
+	}
+
+	// Run the bilateral-filter denoise pass: reads from `sourceTexture` and
+	// writes the denoised result into `target` (a WebGLRenderTarget).
+	_applyDenoise( sourceTexture, target ) {
+
+		const renderer = this._renderer;
+		const denoiseQuad = this._denoiseQuad;
+
+		this._denoiseMaterial.map = sourceTexture;
+		denoiseQuad.material = this._denoiseMaterial;
+
+		const ogTarget = renderer.getRenderTarget();
+		renderer.setRenderTarget( target );
+		denoiseQuad.render( renderer );
+		renderer.setRenderTarget( ogTarget );
+
+	}
+
+	// Blend between a raw texture and a denoised texture using `blendFactor`
+	// (0 = raw, 1 = denoised) and write the result into `target`.
+	_applyDenoiseBlend( rawTexture, denoisedTexture, blendFactor, target ) {
+
+		const renderer = this._renderer;
+		const lerpQuad = this._denoiseLerpQuad;
+
+		this._denoiseLerpMaterial.rawMap = rawTexture;
+		this._denoiseLerpMaterial.denoisedMap = denoisedTexture;
+		this._denoiseLerpMaterial.blendFactor = blendFactor;
+		lerpQuad.material = this._denoiseLerpMaterial;
+
+		const ogTarget = renderer.getRenderTarget();
+		renderer.setRenderTarget( target );
+		lerpQuad.render( renderer );
+		renderer.setRenderTarget( ogTarget );
+
+	}
+
+	// Resolve the texture that should be displayed for a given path-tracer
+	// output.  Returns the appropriate texture (raw, denoised, or blended).
+	_resolveDenoisedTexture( sourceTexture, denoiseTarget, blendTarget, denoiseFactor ) {
+
+		this._applyDenoise( sourceTexture, denoiseTarget );
+
+		if ( denoiseFactor < 1.0 ) {
+
+			this._applyDenoiseBlend(
+				sourceTexture,
+				denoiseTarget.texture,
+				denoiseFactor,
+				blendTarget,
+			);
+			return blendTarget.texture;
+
+		}
+
+		return denoiseTarget.texture;
+
+	}
+
 	renderSample() {
 
 		const lowResPathTracer = this._lowResPathTracer;
@@ -398,6 +597,7 @@ export class WebGLPathTracer {
 			pathTracer.reset();
 			lowResPathTracer.reset();
 			this._queueReset = false;
+			this._denoiseFired = false;
 
 			quad.material.opacity = 0;
 			clock.start();
@@ -422,6 +622,19 @@ export class WebGLPathTracer {
 
 			const renderer = this._renderer;
 			const minSamples = this.minSamples;
+			const samples = this.samples;
+
+			// --- Denoise bookkeeping ---
+			const denoiseEnabled = this.enableDenoise;
+			const denoiseFactor = denoiseEnabled
+				? this._getDenoiseBlendFactor( samples )
+				: 0;
+
+			if ( denoiseEnabled && denoiseFactor > 0 ) {
+
+				this._updateDenoiseUniforms( samples );
+
+			}
 
 			if ( elapsedTime >= this.renderDelay && this.samples >= this.minSamples ) {
 
@@ -432,6 +645,18 @@ export class WebGLPathTracer {
 				} else {
 
 					quad.material.opacity = 1;
+
+				}
+
+			}
+
+			// Fire target-samples callback (once per accumulation run).
+			if ( this.targetSamples > 0 && samples >= this.targetSamples && ! this._denoiseFired ) {
+
+				this._denoiseFired = true;
+				if ( typeof this.onTargetSamplesReached === 'function' ) {
+
+					this.onTargetSamplesReached( samples );
 
 				}
 
@@ -449,9 +674,24 @@ export class WebGLPathTracer {
 
 					}
 
+					// Determine the low-res display texture, applying denoise
+					// when enabled so the preview is cleaner during the
+					// accumulation phase.
+					let lowResTexture = lowResPathTracer.target.texture;
+					if ( denoiseEnabled && denoiseFactor > 0 ) {
+
+						lowResTexture = this._resolveDenoisedTexture(
+							lowResPathTracer.target.texture,
+							this._denoiseLowResTarget,
+							this._denoiseLowResBlendTarget,
+							denoiseFactor,
+						);
+
+					}
+
 					const currentOpacity = quad.material.opacity;
 					quad.material.opacity = 1 - quad.material.opacity;
-					quad.material.map = lowResPathTracer.target.texture;
+					quad.material.map = lowResTexture;
 					quad.render( renderer );
 					quad.material.opacity = currentOpacity;
 
@@ -476,7 +716,21 @@ export class WebGLPathTracer {
 
 				}
 
-				quad.material.map = pathTracer.target.texture;
+				// Determine the full-res display texture, applying denoise
+				// when enabled.
+				let displayTexture = pathTracer.target.texture;
+				if ( denoiseEnabled && denoiseFactor > 0 ) {
+
+					displayTexture = this._resolveDenoisedTexture(
+						pathTracer.target.texture,
+						this._denoiseTarget,
+						this._denoiseBlendTarget,
+						denoiseFactor,
+					);
+
+				}
+
+				quad.material.map = displayTexture;
 				this.renderToCanvasCallback( pathTracer.target, renderer, quad );
 				quad.material.blending = NoBlending;
 
@@ -499,6 +753,16 @@ export class WebGLPathTracer {
 		this._quad.material.dispose();
 		this._pathTracer.dispose();
 
+		// Denoise resources
+		this._denoiseQuad.dispose();
+		this._denoiseMaterial.dispose();
+		this._denoiseLerpQuad.dispose();
+		this._denoiseLerpMaterial.dispose();
+		this._denoiseTarget.dispose();
+		this._denoiseBlendTarget.dispose();
+		this._denoiseLowResTarget.dispose();
+		this._denoiseLowResBlendTarget.dispose();
+
 	}
 
 	_updateScale() {
@@ -519,6 +783,29 @@ export class WebGLPathTracer {
 				this._lowResPathTracer.setSize( Math.floor( w * lowResScale ), Math.floor( h * lowResScale ) );
 
 			}
+
+			// Denoise targets – sized every frame so that changes to
+			// denoiseResolution or lowResScale are picked up immediately.
+			// WebGLRenderTarget.setSize is a no-op when the dimensions match.
+			const denoiseRes = this.denoiseResolution;
+
+			this._denoiseTarget.setSize(
+				Math.max( 1, Math.floor( w * denoiseRes ) ),
+				Math.max( 1, Math.floor( h * denoiseRes ) ),
+			);
+			this._denoiseBlendTarget.setSize( w, h );
+
+			const lw = Math.floor( w * this.lowResScale );
+			const lh = Math.floor( h * this.lowResScale );
+
+			this._denoiseLowResTarget.setSize(
+				Math.max( 1, Math.floor( lw * denoiseRes ) ),
+				Math.max( 1, Math.floor( lh * denoiseRes ) ),
+			);
+			this._denoiseLowResBlendTarget.setSize(
+				Math.max( 1, lw ),
+				Math.max( 1, lh ),
+			);
 
 		}
 
