@@ -1,6 +1,8 @@
 // core
 export * from './core/PathTracingSceneGenerator.js';
 export * from './core/WebGLPathTracer.js';
+export * from './core/SceneDataManager.js';
+export * from './core/OutputCompositor.js';
 
 // objects
 export * from './objects/PhysicalCamera.js';

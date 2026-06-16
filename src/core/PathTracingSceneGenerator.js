@@ -2,76 +2,7 @@ import { BufferGeometry } from 'three';
 import { MeshBVH, SAH } from 'three-mesh-bvh';
 import { StaticGeometryGenerator, NO_CHANGE, GEOMETRY_ADJUSTED, GEOMETRY_REBUILT } from './utils/StaticGeometryGenerator.js';
 import { updateMaterialIndexAttribute } from './utils/GeometryPreparationUtils.js';
-
-// collect the textures from the materials
-function getTextures( materials ) {
-
-	const textureSet = new Set();
-	for ( let i = 0, l = materials.length; i < l; i ++ ) {
-
-		const material = materials[ i ];
-		for ( const key in material ) {
-
-			const value = material[ key ];
-			if ( value && value.isTexture ) {
-
-				textureSet.add( value );
-
-			}
-
-		}
-
-	}
-
-	return Array.from( textureSet );
-
-}
-
-// collect the lights in the scene
-function getLights( objects ) {
-
-	const lights = [];
-	const iesSet = new Set();
-	for ( let i = 0, l = objects.length; i < l; i ++ ) {
-
-		objects[ i ].traverse( c => {
-
-			if ( c.visible ) {
-
-				if (
-					c.isRectAreaLight ||
-					c.isSpotLight ||
-					c.isPointLight ||
-					c.isDirectionalLight
-				) {
-
-					lights.push( c );
-
-					if ( c.iesMap ) {
-
-						iesSet.add( c.iesMap );
-
-					}
-
-				}
-
-			}
-
-		} );
-
-	}
-
-	const iesTextures = Array.from( iesSet ).sort( ( a, b ) => {
-
-		if ( a.uuid < b.uuid ) return 1;
-		if ( a.uuid > b.uuid ) return - 1;
-		return 0;
-
-	} );
-
-	return { lights, iesTextures };
-
-}
+import { getLights, getTextures } from './utils/sceneUpdateUtils.js';
 
 export class PathTracingSceneGenerator {
 
@@ -194,6 +125,10 @@ export class PathTracingSceneGenerator {
 
 		}
 
+		// Use the canonical getTextures / getLights from sceneUpdateUtils.
+		// getTextures handles texture-hash dedup and uuid sorting.
+		// getLights accepts an array of root objects (or a single scene) and
+		// returns { lights, iesTextures }.
 		const textures = getTextures( materials );
 		const { lights, iesTextures } = getLights( objects );
 		if ( needsMaterialIndexUpdate ) {

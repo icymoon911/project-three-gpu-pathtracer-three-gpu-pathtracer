@@ -4,6 +4,35 @@ import { BlendMaterial } from '../materials/fullscreen/BlendMaterial.js';
 import { SobolNumberMapGenerator } from '../utils/SobolNumberMapGenerator.js';
 import { PhysicalPathTracingMaterial } from '../materials/pathtracing/PhysicalPathTracingMaterial.js';
 
+/**
+ * renderTask — generator that progressively accumulates path-traced samples.
+ *
+ * ALPHA BLENDING ARCHITECTURE (Layer 1 of 2):
+ *
+ * This generator implements the FIRST of two alpha-compositing layers in the system:
+ *
+ *   Layer 1 (this file): Progressive sample accumulation with correct alpha.
+ *     When `alpha = true`, each new sample is rendered with NoBlending into
+ *     _primaryTarget, then blended into the accumulated result via _blendTargets
+ *     and BlendMaterial. The blend weight is `_opacityFactor / (samples + 1)`,
+ *     which implements a running average: sample N contributes 1/(N+1) of the
+ *     final pixel. The accumulated result is exposed via the `target` getter,
+ *     which returns _blendTargets[1] when alpha is on, or _primaryTarget when off.
+ *
+ *   Layer 2 (OutputCompositor, called by WebGLPathTracer.renderSample): Visual
+ *     fade-in transition from a low-res/rasterized preview to the full-res
+ *     path-traced output. Uses opacity animation and blending modes on a
+ *     FullScreenQuad with ClampedInterpolationMaterial. This layer reads from
+ *     `pathTracer.target` (the output of Layer 1) and composites it to the canvas.
+ *
+ * These two layers serve different purposes and cannot be merged:
+ *   - Layer 1 ensures correct per-pixel alpha accumulation across samples.
+ *   - Layer 2 provides a smooth UX transition effect during the initial render.
+ *
+ * The `alpha` property controls whether Layer 1 is active. It is automatically
+ * enabled by WebGLPathTracer when the scene background is transparent or when
+ * the renderer does not support EXT_float_blend.
+ */
 function* renderTask() {
 
 	const {
@@ -27,12 +56,18 @@ function* renderTask() {
 
 		if ( alpha ) {
 
+			// Layer 1 alpha path: render each sample with NoBlending (no hardware blend)
+			// into _primaryTarget, then manually blend it into the accumulated result
+			// using BlendMaterial on _blendTargets. The weight 1/(samples+1) implements
+			// a running average so each new sample contributes equally.
 			blendMaterial.opacity = this._opacityFactor / ( this.samples + 1 );
 			material.blending = NoBlending;
 			material.opacity = 1;
 
 		} else {
 
+			// Non-alpha path: use hardware NormalBlending with decreasing opacity to
+			// accumulate samples as a running average directly in _primaryTarget.
 			material.opacity = this._opacityFactor / ( this.samples + 1 );
 			material.blending = NormalBlending;
 
@@ -115,7 +150,10 @@ function* renderTask() {
 				_renderer.setRenderTarget( ogRenderTarget );
 				_renderer.autoClear = ogAutoClear;
 
-				// swap and blend alpha targets
+				// swap and blend alpha targets: BlendMaterial composites the new sample
+				// from _primaryTarget onto the accumulated result in blendTarget1,
+				// writing the result into blendTarget2. Then we swap so blendTarget1
+				// always holds the latest accumulated image.
 				if ( alpha ) {
 
 					blendMaterial.target1 = blendTarget1.texture;
@@ -166,6 +204,12 @@ export class PathTracingRenderer {
 
 	}
 
+	/**
+	 * The accumulated output texture. When alpha blending is active, this returns
+	 * _blendTargets[1] (the manually-composited running average). When alpha is off,
+	 * it returns _primaryTarget (the hardware-blended result). This texture is what
+	 * OutputCompositor (Layer 2) reads from to display on the canvas.
+	 */
 	get target() {
 
 		return this._alpha ? this._blendTargets[ 1 ] : this._primaryTarget;

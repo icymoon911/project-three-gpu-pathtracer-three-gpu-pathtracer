@@ -1,11 +1,10 @@
-import { PerspectiveCamera, Scene, Vector2, Clock, NormalBlending, NoBlending, AdditiveBlending } from 'three';
+import { PerspectiveCamera, Scene, Vector2, Clock } from 'three';
 import { PathTracingSceneGenerator } from './PathTracingSceneGenerator.js';
 import { PathTracingRenderer } from './PathTracingRenderer.js';
 import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
-import { GradientEquirectTexture } from '../textures/GradientEquirectTexture.js';
-import { getIesTextures, getLights, getTextures } from './utils/sceneUpdateUtils.js';
 import { ClampedInterpolationMaterial } from '../materials/fullscreen/ClampedInterpolationMaterial.js';
-import { CubeToEquirectGenerator } from '../utils/CubeToEquirectGenerator.js';
+import { SceneDataManager } from './SceneDataManager.js';
+import { OutputCompositor } from './OutputCompositor.js';
 
 function supportsFloatBlending( renderer ) {
 
@@ -115,15 +114,12 @@ export class WebGLPathTracer {
 		this._quad = new FullScreenQuad( new ClampedInterpolationMaterial( {
 			map: null,
 			transparent: true,
-			blending: NoBlending,
 
 			premultipliedAlpha: renderer.getContextAttributes().premultipliedAlpha,
 		} ) );
-		this._materials = null;
 
-		this._previousEnvironment = null;
-		this._previousBackground = null;
-		this._internalBackground = null;
+		this._sceneDataManager = new SceneDataManager( renderer, this._pathTracer, this._lowResPathTracer );
+		this._compositor = new OutputCompositor( renderer, this._quad );
 
 		// options
 		this.renderDelay = 100;
@@ -206,6 +202,9 @@ export class WebGLPathTracer {
 
 	}
 
+	/**
+	 * Update camera uniforms on both path tracers and trigger a single sample reset.
+	 */
 	updateCamera() {
 
 		const camera = this.camera;
@@ -217,125 +216,50 @@ export class WebGLPathTracer {
 
 	}
 
+	/**
+	 * Update material data on the path-tracing material and trigger a sample reset.
+	 * For batch updates (e.g. during setScene), use _sceneDataManager directly to
+	 * avoid redundant resets.
+	 */
 	updateMaterials() {
 
-		const material = this._pathTracer.material;
-		const renderer = this._renderer;
-		const materials = this._materials;
-		const textureSize = this.textureSize;
-
-		// reduce texture sources here - we don't want to do this in the
-		// textures array because we need to pass the textures array into the
-		// material target
-		const textures = getTextures( materials );
-		material.textures.setTextures( renderer, textures, textureSize.x, textureSize.y );
-		material.materials.updateFrom( materials, textures );
+		this._sceneDataManager.updateMaterials( this.textureSize );
 		this.reset();
 
 	}
 
+	/**
+	 * Update light data on the path-tracing material and trigger a sample reset.
+	 * For batch updates (e.g. during setScene), use _sceneDataManager directly to
+	 * avoid redundant resets.
+	 */
 	updateLights() {
 
-		const scene = this.scene;
-		const renderer = this._renderer;
-		const material = this._pathTracer.material;
-
-		const lights = getLights( scene );
-		const iesTextures = getIesTextures( lights );
-		material.lights.updateFrom( lights, iesTextures );
-		material.iesProfiles.setTextures( renderer, iesTextures );
+		this._sceneDataManager.updateLights( this.scene );
 		this.reset();
 
 	}
 
+	/**
+	 * Update environment map and background on the path-tracing material and trigger
+	 * a sample reset. For batch updates (e.g. during setScene), use _sceneDataManager
+	 * directly to avoid redundant resets.
+	 */
 	updateEnvironment() {
 
-		const scene = this.scene;
-		const material = this._pathTracer.material;
-
-		if ( this._internalBackground ) {
-
-			this._internalBackground.dispose();
-			this._internalBackground = null;
-
-		}
-
-		// update scene background
-		material.backgroundBlur = scene.backgroundBlurriness;
-		material.backgroundIntensity = scene.backgroundIntensity ?? 1;
-		material.backgroundRotation.makeRotationFromEuler( scene.backgroundRotation ).invert();
-		if ( scene.background === null ) {
-
-			material.backgroundMap = null;
-			material.backgroundAlpha = 0;
-
-		} else if ( scene.background.isColor ) {
-
-			this._colorBackground = this._colorBackground || new GradientEquirectTexture( 16 );
-
-			const colorBackground = this._colorBackground;
-			if ( ! colorBackground.topColor.equals( scene.background ) ) {
-
-				// set the texture color
-				colorBackground.topColor.set( scene.background );
-				colorBackground.bottomColor.set( scene.background );
-				colorBackground.update();
-
-			}
-
-			// assign to material
-			material.backgroundMap = colorBackground;
-			material.backgroundAlpha = 1;
-
-		} else if ( scene.background.isCubeTexture ) {
-
-			if ( scene.background !== this._previousBackground ) {
-
-				const background = new CubeToEquirectGenerator( this._renderer ).generate( scene.background );
-				this._internalBackground = background;
-				material.backgroundMap = background;
-				material.backgroundAlpha = 1;
-
-			}
-
-		} else {
-
-			material.backgroundMap = scene.background;
-			material.backgroundAlpha = 1;
-
-		}
-
-		// update scene environment
-		material.environmentIntensity = scene.environment !== null ? ( scene.environmentIntensity ?? 1 ) : 0;
-		material.environmentRotation.makeRotationFromEuler( scene.environmentRotation ).invert();
-		if ( this._previousEnvironment !== scene.environment ) {
-
-			if ( scene.environment !== null ) {
-
-				if ( scene.environment.isCubeTexture ) {
-
-					const environment = new CubeToEquirectGenerator( this._renderer ).generate( scene.environment );
-					material.envMapInfo.updateFrom( environment );
-
-				} else {
-
-					// TODO: Consider setting this to the highest supported bit depth by checking for
-					// OES_texture_float_linear or OES_texture_half_float_linear. Requires changes to
-					// the equirect uniform
-					material.envMapInfo.updateFrom( scene.environment );
-
-				}
-
-			}
-
-		}
-
-		this._previousEnvironment = scene.environment;
-		this._previousBackground = scene.background;
+		this._sceneDataManager.updateEnvironment( this.scene );
 		this.reset();
 
 	}
 
+	/**
+	 * Apply results from PathTracingSceneGenerator to the path-tracing material.
+	 *
+	 * All scene-data updates (materials, environment, lights) are batched through
+	 * SceneDataManager WITHOUT triggering individual resets. A single reset is then
+	 * performed by updateCamera() at the end, ensuring that a setScene call only
+	 * clears accumulated samples once.
+	 */
 	_updateFromResults( scene, camera, results ) {
 
 		const {
@@ -346,7 +270,7 @@ export class WebGLPathTracer {
 			needsMaterialIndexUpdate,
 		} = results;
 
-		this._materials = materials;
+		this._sceneDataManager.setMaterials( materials );
 
 		const pathTracer = this._pathTracer;
 		const material = pathTracer.material;
@@ -374,15 +298,32 @@ export class WebGLPathTracer {
 		this.scene = scene;
 		this.camera = camera;
 
+		// Batch scene-data updates: materials, environment, and lights are all applied
+		// without intermediate resets. updateCamera() triggers the single reset at the end.
+		this._sceneDataManager.updateMaterials( this.textureSize );
+		this._sceneDataManager.updateEnvironment( scene );
+		this._sceneDataManager.updateLights( scene );
 		this.updateCamera();
-		this.updateMaterials();
-		this.updateEnvironment();
-		this.updateLights();
 
 		return results;
 
 	}
 
+	/**
+	 * Render one sample of the path-traced image and composite the result to the canvas.
+	 *
+	 * The rendering pipeline has two distinct alpha/compositing layers:
+	 *
+	 *   Layer 1 — PathTracingRenderer (internal): progressive sample accumulation with
+	 *             correct alpha compositing via _blendTargets and BlendMaterial. This
+	 *             produces the accumulated path-traced image in `pathTracer.target`.
+	 *
+	 *   Layer 2 — OutputCompositor (this method): takes the accumulated image from Layer 1
+	 *             and composites it to the canvas with a fade-in transition, dynamic low-res
+	 *             preview, and rasterized scene fallback.
+	 *
+	 * These layers serve different purposes and are intentionally kept separate.
+	 */
 	renderSample() {
 
 		const lowResPathTracer = this._lowResPathTracer;
@@ -414,73 +355,31 @@ export class WebGLPathTracer {
 		}
 
 		// when alpha is enabled we use a manual blending system rather than
-		// rendering with a blend function
+		// rendering with a blend function (see PathTracingRenderer for details
+		// on the internal alpha accumulation layer)
 		pathTracer.alpha = pathTracer.material.backgroundAlpha !== 1 || ! supportsFloatBlending( renderer );
 		lowResPathTracer.alpha = pathTracer.alpha;
 
 		if ( this.renderToCanvas ) {
 
-			const renderer = this._renderer;
-			const minSamples = this.minSamples;
-
-			if ( elapsedTime >= this.renderDelay && this.samples >= this.minSamples ) {
-
-				if ( this.fadeDuration !== 0 ) {
-
-					quad.material.opacity = Math.min( quad.material.opacity + delta / this.fadeDuration, 1 );
-
-				} else {
-
-					quad.material.opacity = 1;
-
-				}
-
-			}
-
-			// render the fallback if we haven't rendered enough samples, are paused, or are occluded
-			if ( ! this.enablePathTracing || this.samples < minSamples || quad.material.opacity < 1 ) {
-
-				if ( this.dynamicLowRes && ! this.isCompiling ) {
-
-					if ( lowResPathTracer.samples < 1 ) {
-
-						lowResPathTracer.material = pathTracer.material;
-						lowResPathTracer.update();
-
-					}
-
-					const currentOpacity = quad.material.opacity;
-					quad.material.opacity = 1 - quad.material.opacity;
-					quad.material.map = lowResPathTracer.target.texture;
-					quad.render( renderer );
-					quad.material.opacity = currentOpacity;
-
-				}
-
-				if ( ! this.dynamicLowRes && this.rasterizeScene || this.dynamicLowRes && this.isCompiling ) {
-
-					this.rasterizeSceneCallback( this.scene, this.camera );
-
-				}
-
-			}
-
-
-			if ( this.enablePathTracing && quad.material.opacity > 0 ) {
-
-				if ( quad.material.opacity < 1 ) {
-
-					// use additive blending when the low res texture is rendered so we can fade the
-					// background out while the full res fades in
-					quad.material.blending = this.dynamicLowRes ? AdditiveBlending : NormalBlending;
-
-				}
-
-				quad.material.map = pathTracer.target.texture;
-				this.renderToCanvasCallback( pathTracer.target, renderer, quad );
-				quad.material.blending = NoBlending;
-
-			}
+			this._compositor.compose( {
+				pathTracer,
+				lowResPathTracer,
+				scene: this.scene,
+				camera: this.camera,
+				samples: this.samples,
+				minSamples: this.minSamples,
+				fadeDuration: this.fadeDuration,
+				dynamicLowRes: this.dynamicLowRes,
+				enablePathTracing: this.enablePathTracing,
+				rasterizeScene: this.rasterizeScene,
+				rasterizeSceneCallback: this.rasterizeSceneCallback,
+				renderToCanvasCallback: this.renderToCanvasCallback,
+				isCompiling: this.isCompiling,
+				delta,
+				elapsedTime,
+				renderDelay: this.renderDelay,
+			} );
 
 		}
 
@@ -498,6 +397,7 @@ export class WebGLPathTracer {
 		this._quad.dispose();
 		this._quad.material.dispose();
 		this._pathTracer.dispose();
+		this._sceneDataManager.dispose();
 
 	}
 

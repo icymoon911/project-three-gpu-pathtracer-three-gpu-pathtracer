@@ -69,28 +69,62 @@ export function getTextures( materials ) {
 
 }
 
-export function getLights( scene ) {
+/**
+ * Collects all visible lights from a scene or array of objects.
+ * Accepts either a single scene/object with a `.traverse()` method, or an array of such objects.
+ * Returns an object with `lights` (sorted by uuid) and `iesTextures` (IES profile maps, sorted by uuid).
+ */
+export function getLights( sceneOrObjects ) {
 
 	const lights = [];
-	scene.traverse( c => {
+	const iesSet = new Set();
 
-		if ( c.visible ) {
+	const collectFromObject = ( obj ) => {
 
-			if (
-				c.isRectAreaLight ||
-				c.isSpotLight ||
-				c.isPointLight ||
-				c.isDirectionalLight
-			) {
+		obj.traverse( c => {
 
-				lights.push( c );
+			if ( c.visible ) {
+
+				if (
+					c.isRectAreaLight ||
+					c.isSpotLight ||
+					c.isPointLight ||
+					c.isDirectionalLight
+				) {
+
+					lights.push( c );
+
+					if ( c.iesMap ) {
+
+						iesSet.add( c.iesMap );
+
+					}
+
+				}
 
 			}
 
+		} );
+
+	};
+
+	if ( Array.isArray( sceneOrObjects ) ) {
+
+		for ( let i = 0, l = sceneOrObjects.length; i < l; i ++ ) {
+
+			collectFromObject( sceneOrObjects[ i ] );
+
 		}
 
-	} );
+	} else {
 
-	return lights.sort( uuidSort );
+		collectFromObject( sceneOrObjects );
+
+	}
+
+	return {
+		lights: lights.sort( uuidSort ),
+		iesTextures: Array.from( iesSet ).sort( uuidSort ),
+	};
 
 }
